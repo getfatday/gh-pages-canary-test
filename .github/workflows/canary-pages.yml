@@ -1,0 +1,195 @@
+# Canary GitHub Pages workflow — scaffolded by the `gh-pages` xp-skills plugin.
+# See: plugins/gh-pages/DESIGN.md for the URL layout and deploy semantics.
+
+name: canary-pages
+
+on:
+  push:
+    branches: ['**']
+  delete:
+
+concurrency:
+  group: gh-pages-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Derive branch slug
+        id: slug
+        run: |
+          raw='${{ github.ref_name }}'
+          slug=$(echo "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | tr -s '-' | sed 's/^-//;s/-$//')
+          echo "branch-slug=$slug" >> "$GITHUB_OUTPUT"
+
+      - name: Build every manifest entry
+        id: build
+        run: |
+          set -euo pipefail
+          manifest='prototypes.yaml'
+          if [ ! -f "$manifest" ]; then
+            echo "::error::Manifest $manifest not found"
+            exit 1
+          fi
+
+          # Parse manifest with python+PyYAML (pre-installed on ubuntu-latest).
+          count=$(python3 -c "import yaml,sys; print(len(yaml.safe_load(open('$manifest'))['prototypes']))")
+          echo "Found $count prototype(s)"
+
+          mkdir -p _dist/p
+          for i in $(seq 0 $((count - 1))); do
+            slug=$(python3 -c "import yaml; print(yaml.safe_load(open('$manifest'))['prototypes'][$i]['slug'])")
+            path=$(python3 -c "import yaml; print(yaml.safe_load(open('$manifest'))['prototypes'][$i]['path'])")
+            build=$(python3 -c "import yaml; print(yaml.safe_load(open('$manifest'))['prototypes'][$i]['build'])")
+            dist=$(python3 -c "import yaml; print(yaml.safe_load(open('$manifest'))['prototypes'][$i]['dist'])")
+
+            echo "::group::build $slug ($path)"
+            (cd "$path" && eval "$build")
+            mkdir -p "_dist/p/$slug"
+            cp -r "$path/$dist/." "_dist/p/$slug/"
+            echo "::endgroup::"
+          done
+
+          # Copy the 404 SPA shim to the top of the deployable tree so it lands
+          # at gh-pages:/404.html and gh-pages:/branch/{slug}/404.html via
+          # peaceiris' recursive publish.
+          if [ -f .github/pages/404.html ]; then
+            cp .github/pages/404.html _dist/404.html
+          fi
+
+      - name: Publish (production — main)
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: _dist
+          keep_files: true
+          exclude_assets: 'branch/**'
+
+      - name: Publish (canary — feature branch)
+        if: github.ref != 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: _dist
+          destination_dir: branch/${{ steps.slug.outputs.branch-slug }}
+          keep_files: true
+
+      - name: Regenerate and publish root index
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          git clone --depth=1 --branch gh-pages \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" "$work" || true
+          cd "$work"
+          # First-run safety: if the branch didn't exist, the clone failed and $work is empty.
+          # Initialize an empty gh-pages tree so the subsequent commit has something to push.
+          if [ ! -d .git ]; then
+            git init -b gh-pages
+            git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          fi
+          touch .nojekyll
+          mkdir -p p branch
+
+          {
+            echo '<!doctype html><meta charset="utf-8">'
+            echo "<title>${{ github.repository }} — prototypes</title>"
+            echo '<style>body{font:14px system-ui;max-width:720px;margin:3rem auto;padding:0 1rem}h2{margin-top:2rem}ul{padding-left:1.2rem}</style>'
+            echo "<h1>${{ github.repository }}</h1>"
+            echo '<h2>Prototypes (main)</h2><ul>'
+            for d in p/*/; do
+              [ -d "$d" ] || continue
+              slug=$(basename "$d")
+              echo "<li><a href=\"./p/$slug/\">$slug</a></li>"
+            done
+            echo '</ul><h2>Live branches</h2><ul>'
+            for d in branch/*/; do
+              [ -d "$d" ] || continue
+              bname=$(basename "$d")
+              echo "<li><a href=\"./branch/$bname/\">$bname</a></li>"
+            done
+            echo '</ul>'
+          } > index.html
+
+          # Commit only index.html + .nojekyll. Don't stage branch/*/ or p/*/ —
+          # peaceiris owns those trees.
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add index.html .nojekyll
+          if ! git diff --cached --quiet; then
+            git commit -m "index: refresh root listing"
+            # Retry push on non-fast-forward (peaceiris may push in parallel;
+            # concurrency group serializes the workflow but the two peaceiris
+            # pushes earlier in this job can still race with a later run).
+            for attempt in 1 2 3; do
+              if git push origin gh-pages; then
+                break
+              fi
+              git pull --rebase origin gh-pages || true
+              sleep 2
+            done
+          fi
+
+  cleanup:
+    if: github.event_name == 'delete' && github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+
+      - name: Remove deleted branch's canary subtree
+        run: |
+          set -euo pipefail
+          raw='${{ github.event.ref }}'
+          slug=$(echo "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | tr -s '-' | sed 's/^-//;s/-$//')
+          target="branch/$slug"
+          if [ -d "$target" ]; then
+            rm -rf "$target"
+          fi
+          # Regen the root index after removal.
+          {
+            echo '<!doctype html><meta charset="utf-8">'
+            echo "<title>${{ github.repository }} — prototypes</title>"
+            echo '<style>body{font:14px system-ui;max-width:720px;margin:3rem auto;padding:0 1rem}h2{margin-top:2rem}ul{padding-left:1.2rem}</style>'
+            echo "<h1>${{ github.repository }}</h1>"
+            echo '<h2>Prototypes (main)</h2><ul>'
+            for d in p/*/; do
+              [ -d "$d" ] || continue
+              echo "<li><a href=\"./p/$(basename "$d")/\">$(basename "$d")</a></li>"
+            done
+            echo '</ul><h2>Live branches</h2><ul>'
+            for d in branch/*/; do
+              [ -d "$d" ] || continue
+              echo "<li><a href=\"./branch/$(basename "$d")/\">$(basename "$d")</a></li>"
+            done
+            echo '</ul>'
+          } > index.html
+
+      - name: Commit cleanup
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No cleanup needed."
+          else
+            git commit -m "cleanup: remove canary for deleted branch"
+            git push origin gh-pages
+          fi

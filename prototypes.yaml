@@ -1,0 +1,21 @@
+# prototypes.yaml — authoritative list of prototypes published to GitHub Pages.
+# Every entry produces a build at /p/{slug}/ (main) and /branch/{branch-slug}/p/{slug}/ (canary).
+
+prototypes:
+  - slug: prototype-a
+    title: Prototype A
+    path: prototypes/prototype-a
+    build: npm run build
+    dist: dist
+
+  - slug: prototype-b
+    title: Prototype B
+    path: prototypes/prototype-b
+    build: npm run build
+    dist: dist
+
+  - slug: prototype-c
+    title: Prototype C
+    path: prototypes/prototype-c
+    build: npm run build
+    dist: dist

@@ -1,0 +1,8 @@
+{
+  "name": "prototype-c",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "build": "mkdir -p dist && cp index.html dist/"
+  }
+}
